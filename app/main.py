@@ -11,15 +11,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
+import tempfile
 import time
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Awaitable, Callable, Literal
 
 import psycopg
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
+from exporter import ExportFailed, export_pricelist
 from pool import AcquireTimeoutError, AsyncPool, PoolClosedError, PoolConfig
 
 logging.basicConfig(
@@ -130,6 +134,12 @@ async def _on_sql_failed(req: Request, exc: SqlFailed):
 async def _on_client_gone(req: Request, exc: ClientGone):
     # 客户端已经断开，响应大概率发不出去，状态码仅作记录用途。
     return JSONResponse({"error": "client_disconnected"}, status_code=499)
+
+
+@app.exception_handler(ExportFailed)
+async def _on_export_failed(req: Request, exc: ExportFailed):
+    return JSONResponse(
+        {"error": "export_failed", "detail": str(exc)}, status_code=500)
 
 
 # ---------------------------------------------------------------- 核心执行逻辑
@@ -260,6 +270,69 @@ async def query_error(request: Request, opts: ErrorQuery | None = None):
         return {}  # 不会到达
 
     return await _run_query(request, opts, run)
+
+
+# ---------------------------------------------------------------- 价目表导出
+
+@app.get(
+    "/export/pricelist",
+    summary="导出完整价目表 CSV（两段并行、同一快照）",
+    description=(
+        "以 `boundary` 把商品分成两段，由两条不同的 PostgreSQL 连接并行、"
+        "分批读取（内存只留当前批次）；两段共享同一个一致性快照"
+        "（pg_export_snapshot / SET TRANSACTION SNAPSHOT），一笔同时改两段"
+        "价格的事务在 CSV 里只会整体呈现改前或改后的价格。两段都读完后才"
+        "交付按编号排序的 CSV（id,name,price）；任一段失败则报错并释放"
+        "两路连接。"),
+    responses={200: {"content": {"text/csv": {}}}},
+)
+async def export_pricelist_api(
+    request: Request,
+    boundary: int = Query(
+        ..., ge=0,
+        description="商品编号分界点：id ≤ boundary 为第 1 段，id > boundary 为第 2 段"),
+    batch_size: int = Query(
+        500, ge=1, le=10000, description="每批读取行数（内存只保留当前批次）"),
+    acquire_timeout: float | None = Query(
+        10.0, ge=0, description="等待每路连接的最长时间（秒），null 表示不限"),
+    demo_fail_segment: int | None = Query(
+        None, ge=1, le=2, description="演示/自测用：让该段读完第一批后失败"),
+):
+    pool: AsyncPool = request.app.state.pool
+    workdir = tempfile.mkdtemp(prefix="pricelist_")
+    disconnect = asyncio.create_task(_watch_disconnect(request))
+    export = asyncio.create_task(export_pricelist(
+        pool, boundary=boundary, batch_size=batch_size, workdir=workdir,
+        demo_fail_segment=demo_fail_segment, acquire_timeout=acquire_timeout))
+    try:
+        done, _ = await asyncio.wait(
+            {export, disconnect}, return_when=asyncio.FIRST_COMPLETED)
+        if export in done:
+            try:
+                result = export.result()
+            except BaseException:
+                shutil.rmtree(workdir, ignore_errors=True)
+                raise
+            return FileResponse(
+                result.path,
+                media_type="text/csv",
+                filename="pricelist.csv",
+                headers={
+                    "X-Export-Rows": str(sum(result.rows.values())),
+                    "X-Export-Batches": str(sum(result.batches.values())),
+                },
+                background=BackgroundTask(
+                    shutil.rmtree, workdir, ignore_errors=True))
+        # 客户端先断开：取消导出，两路连接按脏释放，清理临时文件
+        export.cancel()
+        with suppress(asyncio.CancelledError, ExportFailed):
+            await export
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise ClientGone()
+    finally:
+        disconnect.cancel()
+        with suppress(asyncio.CancelledError):
+            await disconnect
 
 
 @app.get("/pool/stats", summary="连接池指标（在用数、等待数等）")

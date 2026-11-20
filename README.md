@@ -35,13 +35,45 @@ docker compose up --build
 | POST | `/query/normal` | 普通查询（`SELECT ... FROM items LIMIT n`） |
 | POST | `/query/slow` | 延时查询（`SELECT pg_sleep(n)`），模拟慢 SQL |
 | POST | `/query/error` | 报错查询：`autocommit` 单语句报错；`transaction` 在 `BEGIN` 后报错，故意留下失败事务 |
+| GET | `/export/pricelist` | 导出完整价目表 CSV：按 `boundary` 分两段，两条连接并行分批读取、共享同一快照；参数见下 |
 | GET | `/pool/stats` | 连接池指标：`in_use`（在用数）、`waiting`（等待数）、`idle`、`cleaning`、`opened_connections` 及各类计数器 |
 | POST | `/demo/burst` | 后台并发发起 n 个慢查询，便于在 `/pool/stats` 观察排队 |
 
 查询类接口的请求体都支持 `acquire_timeout` / `query_timeout`（秒，`null` 表示不限）。
 
 响应码约定：`200` 成功；`503` 等连接超时；`504` 查询执行超时；
-`400` SQL 错误；`502` 连接级故障（如后端被杀）；`499` 客户端中途断开。
+`400` SQL 错误；`500` 导出失败（`export_failed`）；`502` 连接级故障
+（如后端被杀）；`499` 客户端中途断开。
+
+## 价目表导出（两段并行、同一快照）
+
+`GET /export/pricelist` 供报价组导出完整价目表，改价照常进行：
+
+- `boundary`（必填）：商品编号分界点，`id ≤ boundary` 为第 1 段，
+  其余为第 2 段；
+- `batch_size`（默认 500）：每批读取行数；
+- `acquire_timeout`（默认 10 秒）：等待每路连接的最长时间；
+- `demo_fail_segment`（演示/自测用）：让第 1 或第 2 段读完第一批后失败。
+
+实现要点（`app/exporter.py`）：
+
+- **同一快照**：连接 A 开启 `REPEATABLE READ` 只读事务并
+  `pg_export_snapshot()`，连接 B 开启同级事务后
+  `SET TRANSACTION SNAPSHOT` 导入该快照。两段读到的是同一个一致性
+  快照——一笔同时改动两段价格的事务，在 CSV 里只会**整体呈现改前、
+  或整体呈现改后**的价格，绝不混合；
+- **分批流式**：每段各用一个服务端游标（named cursor）按
+  `batch_size` 分批取数，当前批次立即写入各自的临时 spool 文件，
+  **内存只保留当前批次**；最终拼接与 HTTP 发送也都是流式的；
+- **读完才交付**：两段都读完后才拼接（段 1 的 id 全部 ≤ 分界点 <
+  段 2，段内按 id 升序，顺序拼接即全局有序）并返回
+  `text/csv`（`id,name,price`，含 `X-Export-Rows` /
+  `X-Export-Batches` 响应头）；
+- **失败即释放**：任一段失败时 `TaskGroup` 取消另一段，两路连接都
+  按“脏”交还连接池（服务端取消 / 回滚 / 会话验证后再复用或更换），
+  临时文件删除，请求返回 `500 export_failed`；
+- 导出占用池中 **2 条**连接，与其余请求共享连接池；客户端中途断开
+  会取消导出并同样释放两路连接。
 
 ## 在 /docs 里演示
 
@@ -57,11 +89,34 @@ docker compose up --build
 5. **客户端取消**：用 `curl` 发一个慢查询后按 `Ctrl-C` 中断，
    `/pool/stats` 的 `waiting`/`in_use` 会立刻回落，
    `counters.queue_cancelled` 或 `client_disconnects` 加一。
+6. **并发改价（同一快照）**：终端 1 开启一笔跨两段的改价事务，
+   中间停 10 秒：
+
+   ```bash
+   docker compose exec db psql -U app -d demo -c "
+   BEGIN;
+   UPDATE items SET price = price + 10 WHERE id <= 10;
+   SELECT pg_sleep(10);
+   UPDATE items SET price = price + 10 WHERE id > 10;
+   COMMIT;"
+   ```
+
+   在这 10 秒窗口内，于 `/docs` 调用 `GET /export/pricelist`
+   （`boundary=10`）下载 CSV：两段都是**改前**价格（导出快照建立
+   时改价事务尚未提交）。等事务提交后再导一次：两段都是**改后**
+   价格。任何时刻都不会出现一段新、一段旧的混合文件。
+7. **单路失败**：`/docs` 调用 `GET /export/pricelist` 时设
+   `demo_fail_segment=2`（或 1），该段读完第一批后失败，返回
+   `500 {"error":"export_failed","detail":"...segment 2..."}`；
+   立刻查 `/pool/stats` 可见 `cleaning` 短暂为 1~2（两路脏连接被
+   清理/更换），随后恢复 `idle=4`；再次正常导出仍成功。
 
 ## 自测
 
 ```bash
 pip install -r tests/requirements.txt
+# 价目表导出用例需要直连数据库（默认即 compose 映射的地址）
+export PGDSN="postgresql://app:app@127.0.0.1:5432/demo"
 # 可选：提供 psql 连接串后，会额外做服务端核对
 # （连接数不超过上限、无残留活跃查询、无失败事务）
 export PSQL="postgresql://app:app@127.0.0.1:5432/demo"
@@ -70,8 +125,18 @@ python tests/selftest.py
 
 覆盖：普通查询、排队与并发上限、等连接超时、排队取消释放名额、
 查询超时后的连接清理/更换、两类 SQL 报错后的复用、客户端断开、
-以及取消与归还交错的压力测试（全程校验
-`idle + in_use + cleaning == size` 且 `opened_connections <= size`）。
+取消与归还交错的压力测试（全程校验
+`idle + in_use + cleaning == size` 且 `opened_connections <= size`），
+以及价目表导出：
+
+- **基本导出**：CSV 表头/行数/排序与库内一致，`batch_size=1` 时
+  批次数等于行数，分界点在编号范围外时导出仍完整；
+- **并发改价**：先插入 2 万行让第 2 段分批读取持续数秒，改价事务
+  在导出中途提交——导出文件必须**全部**是改前价格（快照建立于提交
+  之前），提交后再导必须**全部**是改后价格；用例结束自动还原数据；
+- **单路失败**：`demo_fail_segment=1/2` 各失败一次，均返回
+  `500 export_failed` 且指明失败段；随后校验连接池完全恢复、
+  服务端无残留事务/活跃查询、连接数等于池上限，且再次导出成功。
 
 ## 关键设计
 
@@ -90,6 +155,12 @@ python tests/selftest.py
 
 ## 已知限制
 
+- 导出期间两路快照事务会一直存续到两段读完：超大表的长耗时导出会
+  撑住快照（xmin 不前进），阻碍 vacuum 清理死元组；请按表规模选择
+  合适的导出窗口。导出本身不设总超时（只有等连接超时），需要时可
+  在反向代理层加限制。
+- 导出的临时 spool 文件落在 API 容器的临时目录，响应发送完毕后
+  删除；进程异常退出时可能残留，需按 `pricelist_*` 前缀定期清理。
 - 连接关闭失败（如对端无响应且超时）时，客户端按已关闭记账，服务端
   可能短暂残留连接，依赖 PostgreSQL 的 TCP keepalive 最终回收；
   `/pool/stats` 的 `opened_connections` 是客户端视角。
